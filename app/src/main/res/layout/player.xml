@@ -236,14 +236,14 @@
             android:visibility="gone"
             tools:text="[gesture]" />
 
-        <!-- TOP CONTROLS - Now with play button on left -->
+        <!-- TOP CONTROLS - Transparent background -->
         <LinearLayout
             android:id="@+id/top_controls"
             style="?buttonBarStyle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_alignParentTop="true"
-            android:background="#bf000000"
+            android:background="@android:color/transparent"
             android:orientation="horizontal"
             android:padding="8dp">
 
