@@ -87,6 +87,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     // convenience alias
     private val player get() = binding.player
 
+    // ADD: Horizontal drag seeking variables
+    private var isHorizontalSeeking = false
+    private var seekStartX = 0f
+    private var seekStartPosition = 0.0
+    private var wasPlayingBeforeSeek = false
+    private var seekDirection = "" // "+" or "-" or ""
+
+    // ADD: Real-time seek throttle control
+    private var isSeekInProgress = false
+    private val seekThrottleMs = 16L // ~60fps throttle
+
     private val seekBarChangeListener = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser)
@@ -212,8 +223,15 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playbackSeekbar.setOnSeekBarChangeListener(seekBarChangeListener)
         }
 
+        // ENHANCE: Add horizontal drag seeking to player touch listener
         player.setOnTouchListener { _, e ->
-            if (lockedUI) false else gestures.onTouchEvent(e)
+            if (lockedUI) false else {
+                if (handleHorizontalDragSeeking(e)) {
+                    true
+                } else {
+                    gestures.onTouchEvent(e)
+                }
+            }
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(binding.outside) { _, windowInsets ->
@@ -236,6 +254,135 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         addOnPictureInPictureModeChangedListener { info ->
             onPiPModeChangedImpl(info.isInPictureInPictureMode)
+        }
+    }
+
+    // ADD: Horizontal drag seeking implementation
+    private fun handleHorizontalDragSeeking(event: MotionEvent): Boolean {
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                // Only start horizontal seeking if smooth seek gesture is enabled
+                if (smoothSeekGesture) {
+                    seekStartX = event.x
+                    seekStartPosition = MPVLib.getPropertyDouble("time-pos") ?: 0.0
+                    wasPlayingBeforeSeek = MPVLib.getPropertyBoolean("pause") == false
+                    isHorizontalSeeking = true
+                    seekDirection = ""
+                    
+                    // Pause for precise seeking if video was playing
+                    if (wasPlayingBeforeSeek) {
+                        player.paused = true
+                    }
+                    
+                    showControls()
+                    return true
+                }
+                return false
+            }
+            
+            MotionEvent.ACTION_MOVE -> {
+                if (isHorizontalSeeking) {
+                    val currentX = event.x
+                    handleHorizontalSeeking(currentX)
+                    return true
+                }
+                return false
+            }
+            
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isHorizontalSeeking) {
+                    endHorizontalSeeking()
+                    return true
+                }
+                return false
+            }
+        }
+        return false
+    }
+
+    // ADD: Handle horizontal seeking movement
+    private fun handleHorizontalSeeking(currentX: Float) {
+        if (!isHorizontalSeeking) return
+        
+        val deltaX = currentX - seekStartX
+        
+        // Calculate pixels per second sensitivity (adjust this value for different seek speeds)
+        val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowManager.currentWindowMetrics.bounds.width().toFloat()
+        } else {
+            @Suppress("DEPRECATION")
+            val dm = DisplayMetrics()
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            dm.widthPixels.toFloat()
+        }
+        
+        val pixelsPerSecond = screenWidth / 10f // Screen width = 10 seconds
+        val timeDeltaSeconds = deltaX / pixelsPerSecond
+        val newPositionSeconds = seekStartPosition + timeDeltaSeconds
+        val duration = MPVLib.getPropertyDouble("duration") ?: 0.0
+        val clampedPosition = newPositionSeconds.coerceIn(0.0, duration)
+        
+        // Update seek direction for UI feedback
+        seekDirection = if (deltaX > 0) "+" else if (deltaX < 0) "-" else ""
+        
+        // Update UI instantly
+        updateSeekTimeDisplay(clampedPosition)
+        
+        // Perform real-time seek with throttle
+        performRealTimeSeek(clampedPosition)
+    }
+
+    // ADD: Perform real-time seek with throttle
+    private fun performRealTimeSeek(targetPosition: Double) {
+        if (isSeekInProgress) return
+        
+        isSeekInProgress = true
+        MPVLib.command(arrayOf("seek", targetPosition.toString(), "absolute", "exact"))
+        
+        // Reset throttle after delay
+        eventUiHandler.postDelayed({
+            isSeekInProgress = false
+        }, seekThrottleMs)
+    }
+
+    // ADD: Update seek time display during dragging
+    private fun updateSeekTimeDisplay(position: Double) {
+        val positionText = Utils.prettyTime(position.toInt())
+        val directionIndicator = if (seekDirection.isNotEmpty()) " $seekDirection" else ""
+        binding.gestureTextView.text = getString(R.string.ui_seek_distance, positionText, directionIndicator)
+        binding.gestureTextView.visibility = View.VISIBLE
+        
+        // Show controls during seeking
+        showControls()
+    }
+
+    // ADD: End horizontal seeking
+    private fun endHorizontalSeeking() {
+        if (isHorizontalSeeking) {
+            // Get final position and ensure we're exactly there
+            val currentPos = MPVLib.getPropertyDouble("time-pos") ?: seekStartPosition
+            performRealTimeSeek(currentPos)
+            
+            // Resume playback if it was playing before
+            if (wasPlayingBeforeSeek) {
+                eventUiHandler.postDelayed({
+                    player.paused = false
+                }, 100)
+            }
+            
+            // Reset states
+            isHorizontalSeeking = false
+            seekStartX = 0f
+            seekStartPosition = 0.0
+            wasPlayingBeforeSeek = false
+            seekDirection = ""
+            
+            // Hide gesture text after delay
+            fadeHandler.removeCallbacks(fadeRunnable3)
+            fadeHandler.postDelayed(fadeRunnable3, 1000L)
+            
+            // Re-trigger controls timeout
+            showControls()
         }
     }
 
@@ -468,6 +615,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         this.ignoreAudioFocus = prefs.getBoolean("ignore_audio_focus", false)
         this.playlistExitWarning = prefs.getBoolean("playlist_exit_warning", true)
         this.smoothSeekGesture = prefs.getBoolean("seek_gesture_smooth", false)
+        
+        // ADD: Log the setting state
+        Log.v(TAG, "Smooth seek gesture enabled: $smoothSeekGesture")
     }
 
     private fun writeSettings() {
@@ -655,7 +805,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun controlsShouldBeVisible(): Boolean {
         if (lockedUI)
             return false
-        return useAudioUI || btnSelected != -1 || userIsOperatingSeekbar
+        return useAudioUI || btnSelected != -1 || userIsOperatingSeekbar || isHorizontalSeeking
     }
 
     /** Make controls visible, also controls the timeout until they fade. */
@@ -1931,8 +2081,16 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         fadeHandler.postDelayed(fadeRunnable3, 500L)
     }
 
+    // MODIFY: Enhance the existing gesture system to work with horizontal drag seeking
     override fun onPropertyChange(p: PropertyChange, diff: Float) {
         val gestureTextView = binding.gestureTextView
+        
+        // If horizontal seeking is active, let it take precedence
+        if (isHorizontalSeeking && p == PropertyChange.Seek) {
+            // Horizontal drag seeking handles this differently
+            return
+        }
+        
         when (p) {
             /* Drag gestures */
             PropertyChange.Init -> {
@@ -1956,31 +2114,32 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                 gestureTextView.text = ""
             }
             PropertyChange.Seek -> {
-                // disable seeking when duration is unknown
-                val duration = (psc.duration / 1000f)
-                if (duration == 0f || initialSeek < 0)
-                    return
-                if (smoothSeekGesture && pausedForSeek == 0) {
-                    pausedForSeek = if (psc.pause) 2 else 1
-                    if (pausedForSeek == 1)
-                        player.paused = true
-                }
+                // Only handle this if horizontal seeking is NOT active
+                if (!isHorizontalSeeking) {
+                    // disable seeking when duration is unknown
+                    val duration = (psc.duration / 1000f)
+                    if (duration == 0f || initialSeek < 0)
+                        return
+                    if (smoothSeekGesture && pausedForSeek == 0) {
+                        pausedForSeek = if (psc.pause) 2 else 1
+                        if (pausedForSeek == 1)
+                            player.paused = true
+                    }
 
-                val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
-                val newPos = newPosExact.roundToInt()
-                val newDiff = (newPosExact - initialSeek).roundToInt()
-                if (smoothSeekGesture) {
-                    player.timePos = newPosExact.toDouble() // (exact seek)
-                } else {
-                    // seek faster than assigning to timePos but less precise
-                    MPVLib.command(arrayOf("seek", "$newPosExact", "absolute+keyframes"))
-                }
-                // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
-                // actually present in the file, and not the exact one we specified.
+                    val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
+                    val newPos = newPosExact.roundToInt()
+                    val newDiff = (newPosExact - initialSeek).roundToInt()
+                    if (smoothSeekGesture) {
+                        player.timePos = newPosExact.toDouble() // (exact seek)
+                    } else {
+                        // seek faster than assigning to timePos but less precise
+                        MPVLib.command(arrayOf("seek", "$newPosExact", "absolute+keyframes"))
+                    }
 
-                val posText = Utils.prettyTime(newPos)
-                val diffText = Utils.prettyTime(newDiff, true)
-                gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
+                    val posText = Utils.prettyTime(newPos)
+                    val diffText = Utils.prettyTime(newDiff, true)
+                    gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
+                }
             }
             PropertyChange.Volume -> {
                 if (maxVolume == 0)
